@@ -2,7 +2,7 @@
 
 This repository contains the scripts used in the following study.
 
-Hagihara, H., Kimura, N., Yasuda, R., Zaadnoordijk, L., Cusack, R., & Tsuji, S (2025). Comparing automated gaze classifiers in infant looking studies: Accuracy and vulnerability to environmental factors.
+Hagihara, H., Kimura, N., Zaadnoordijk, L., Yasuda, R., Cusack, R., & Tsuji, S (2025). Comparing automated gaze classifiers in infant looking studies: Accuracy and vulnerability to environmental factors.
 
 
 ## analysis
