@@ -1,0 +1,1292 @@
+---
+title: '20240221'
+author: "Hiromichi Hagihara"
+date: "2024-02-21"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(effsize)
+library(here)
+library(lme4)
+library(lmerTest)
+library(car)
+library(emmeans)
+library(gtools)
+library(ggeffects)
+```
+
+
+
+# Pre-processing
+
+```{r}
+d <- read.csv(here("Data", "all_concat_2026Jan15.csv"), header=TRUE) %>% 
+  filter(!filename %in% c("35.mp4", "37.mp4", "38.mp4")) %>% 
+  rename(lighting_mu = mu, lighting_sd = std,
+         area_total = total, area_face = area, area_faceprop = pixel_rate)
+
+d$folder %>% unique()
+d$filename %>% unique() %>% length()
+d$onset %>% unique()
+d$trial %>% unique()
+
+d.raw <- d %>% filter(str_detect(onset, "^trial") & !str_detect(folder, "brighterAI"))
+d.anonym <- d %>% filter(str_detect(onset, "^trial") & str_detect(folder, "brighterAI"))
+d.raw$folder %>% unique()
+d.anonym$folder %>% unique()
+
+d.raw$filename %>% unique() %>% mixedsort() #%>% length()
+d.raw$filename %>% unique() %>% mixedsort() %>% length()
+d.anonym$filename %>% unique() %>% mixedsort() #%>% length()
+d.anonym$filename %>% unique() %>% mixedsort() %>% length()
+
+d.par <- d.raw %>% select(folder, filename) %>% unique() %>% 
+  left_join(read.csv(here("Data", "participant_info.csv"), header=TRUE), by=c("folder", "filename"))
+
+d.par %>% summarize(M=mean(child__age_in_days), SD=sd(child__age_in_days), Min=min(child__age_in_days), Max=max(child__age_in_days))
+d.par$child__gender %>% table()
+
+d.raw %>% select(filename, area_total) %>% unique() %>% subset(!is.na(area_total)) %>% count(area_total)
+# area_total  n
+#     307200  3   -> 640 × 480 px (4:3)
+#     921600 44   -> 1280 × 720 px (16:9)
+```
+
+
+
+# Noise factors quantification
+
+- distance = Distance to the camera (pose_Tz): mm
+- offset_x = Left-right offset (pose_Tx): mm, 0=center, the more right-bottom from the camera view, the bigger the value
+- angle = Facial rolling (pose_Rz = roll): radian, the bigger value indicate rolling toward right from the camera view
+- lighting_mu = mean brightness over the face regions, L-value
+- lighting_sd = sd in birghtness over the face regions, L-value
+- area_total = overall image resolution (pixel)
+- are_face = resolution of the face regions (pixel)
+- area_faceprop = proportion of the face regions (= area_face / area_total)
+- movement (pose_Tx, pose_Ty: lag -> calculate distance
+
+Removed:
+- *lighting = difference in brightness in left-right face regions, L-value, not used in the analysis 
+- *occulusion: confidence [0,1], not used in the analyses
+
+
+```{r}
+# Movement
+tmp.raw <- d.raw %>% group_by(filename, trial, onset) %>% 
+  mutate(diff_x = offset_x - lag(offset_x),
+         diff_y = offset_y - lag(offset_y),
+         movement = sqrt(diff_x^2 + diff_y^2)) %>% 
+  select(filename, trial, onset, frame, movement)
+
+tmp.anonym <- d.anonym %>% group_by(filename, trial, onset) %>% 
+  mutate(diff_x = offset_x - lag(offset_x),
+         diff_y = offset_y - lag(offset_y),
+         movement = sqrt(diff_x^2 + diff_y^2)) %>% 
+  select(filename, trial, onset, frame, movement)
+
+d.raw <- d.raw %>% left_join(tmp.raw, by=c("filename", "trial", "onset", "frame"))
+d.anonym <- d.anonym %>% left_join(tmp.anonym, by=c("filename", "trial", "onset", "frame"))
+
+d.raw %>% select(distance, offset_x, offset_y, angle, lighting_mu, lighting_sd, area_faceprop, movement, occlusion) %>% summary()
+
+# Calculate noise factors (include directions, not absolute values; not used in the analysis)
+d.raw <- d.raw %>% mutate(offset_left = case_when(offset_x > 0 ~ offset_x, TRUE ~ 0),
+                          offset_right = abs(case_when(offset_x <= 0 ~ offset_x, TRUE ~ 0)),
+                          angle_left = case_when(angle > 0 ~ angle, TRUE ~ 0),
+                          angle_right = abs(case_when(angle <= 0 ~ angle, TRUE ~ 0)))
+
+d.raw %>% select(distance, offset_left, offset_right, angle_left, angle_right, lighting_mu, lighting_sd, area_faceprop, movement, occlusion) %>% summary()
+
+d.raw.noise.sum <- d.raw %>% group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(distance = mean(distance, na.rm=TRUE),
+            offset_left = mean(offset_left, na.rm=TRUE),
+            offset_right = mean(offset_right, na.rm=TRUE),
+            angle_left = mean(angle_left, na.rm=TRUE),
+            angle_right = mean(angle_right, na.rm=TRUE),
+            lighting_mu = mean(lighting_mu, na.rm=TRUE),
+            lighting_sd = mean(lighting_sd, na.rm=TRUE),
+            area_faceprop = mean(area_faceprop, na.rm=TRUE),
+            movement = sum(movement, na.rm=TRUE),
+            occlusion = mean(occlusion, na.rm=TRUE)) %>% ungroup() %>% 
+  mutate(across(distance:occlusion, ~ as.numeric(scale(.)), .names = "{.col}_z"))
+
+tmp <- d.raw.noise.sum %>% summarize(across(ends_with("_z"), list(mean = ~mean(.x, na.rm=TRUE), sd = ~sd(.x, na.rm=TRUE)), .names="{.col}_{.fn}"))
+tmp
+
+d.raw.noise.sum$offset_left %>% mean(na.rm=TRUE) %>% round()
+d.raw.noise.sum$offset_left %>% sd(na.rm=TRUE) %>% round()
+d.raw.noise.sum$offset_right %>% mean(na.rm=TRUE) %>% round()
+d.raw.noise.sum$offset_right %>% sd(na.rm=TRUE) %>% round()
+
+
+# Calculate noise factors (absolute values)
+d.raw <- d.raw %>% mutate(offset_abs = abs(offset_x),
+                          angle_abs = abs(angle))
+
+d.raw %>% select(distance, offset_abs, angle_abs, lighting_mu, lighting_sd, area_faceprop, movement, occlusion) %>% summary()
+
+d.raw.noise.sum2 <- d.raw %>% group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(distance = mean(distance, na.rm=TRUE),
+            offset_abs = mean(offset_abs, na.rm=TRUE),
+            angle_abs = mean(angle_abs, na.rm=TRUE),
+            lighting_mu = mean(lighting_mu, na.rm=TRUE),
+            lighting_sd = mean(lighting_sd, na.rm=TRUE),
+            area_faceprop = mean(area_faceprop, na.rm=TRUE),
+            movement = sum(movement, na.rm=TRUE),
+            occlusion = mean(occlusion, na.rm=TRUE)) %>% ungroup() %>% 
+  mutate(across(distance:occlusion, ~ as.numeric(scale(.)), .names = "{.col}_z"))
+
+tmp2 <- d.raw.noise.sum2 %>% summarize(across(ends_with("_z"), list(mean = ~mean(.x, na.rm=TRUE), sd = ~sd(.x, na.rm=TRUE)), .names="{.col}_{.fn}"))
+tmp2
+
+d.raw.noise.sum2$distance %>% mean(na.rm=TRUE) %>% round()
+d.raw.noise.sum2$distance %>% sd(na.rm=TRUE) %>% round()
+
+
+# Calculate noise factors (include directions by discretizing the value)
+d.raw.noise.sum3 <- d.raw %>% group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(offset2 = mean(-offset_x, na.rm=TRUE),  # More rightward (from the infant view) -> Positive
+            angle2 = mean(-angle, na.rm=TRUE)) %>%  # More rightward (from the infant view) -> Positive
+  ungroup() %>% 
+  mutate(across(offset2:angle2, ~ as.numeric(scale(.)), .names = "{.col}_z")) 
+
+tmp3 <- d.raw.noise.sum3 %>% summarize(across(ends_with("_z"), list(mean = ~mean(.x, na.rm=TRUE), sd = ~sd(.x, na.rm=TRUE)), .names="{.col}_{.fn}"))
+tmp3
+
+d.raw.noise.sum3 %>% pivot_longer(offset2:angle2, names_to="Cat", values_to="Val") %>% 
+  group_by(Cat) %>% 
+  summarize(N=n(), Mean=mean(Val, na.rm=TRUE), SD=mean(Val, na.rm=TRUE), Min=min(Val, na.rm=TRUE), Max=max(Val, na.rm=TRUE))
+d.raw.noise.sum3 %>% select(offset2:angle2) %>% summary()
+
+d.raw.noise.sum3 <- d.raw.noise.sum3 %>% 
+  mutate(offset_bin   = cut(offset2,   breaks=c(-Inf, -30, 0, 30, Inf), labels=1:4, include.lowest=TRUE),
+         angle_bin    = cut(angle2,    breaks=c(-Inf, -0.0872665, 0, 0.0872665, Inf), labels=1:4, include.lowest=TRUE))
+  # mutate(offset_bin   = cut(offset2_z,   breaks=c(-Inf, -0.5, 0, 0.5, Inf), labels=1:4, include.lowest=TRUE),
+  #        angle_bin    = cut(angle2_z,    breaks=c(-Inf, -0.5, 0, 0.5, Inf), labels=1:4, include.lowest=TRUE),
+  #        lighting_bin = cut(lighting2_z, breaks=c(-Inf, -0.5, 0, 0.5, Inf), labels=1:4, include.lowest=TRUE))
+
+d.raw.noise.sum3 %>% select(offset_bin, angle_bin) %>% summary()
+
+d.raw.noise.sum3 %>% group_by(offset_bin) %>% 
+  summarize(N=n(), Mean=mean(offset2, na.rm=TRUE), SD=sd(offset2, na.rm=TRUE), Min=min(offset2), Max=max(offset2))
+
+d.raw.noise.sum3 %>% group_by(angle_bin) %>% 
+  summarize(N=n(), Mean=mean(angle2, na.rm=TRUE), SD=sd(angle2, na.rm=TRUE), Min=min(angle2), Max=max(angle2))
+
+# tmp_11 <- d.raw %>% subset(filename=="11.mp4" & trial=="12")
+# tmp_54 <- d.raw %>% subset(filename=="54.mp4" & trial=="7")
+# rm(tmp_11, tmp_54)
+
+d.raw.noise.sum2 %>% select(lighting_mu) %>% summary()
+tmp <- d.raw.noise.sum2 %>% select(filename, trial, onset, lighting_mu) %>% 
+  mutate(lighting_bin = cut(lighting_mu, breaks=c(-Inf, 110, 130, 150, Inf), labels=1:4, include.lowest=TRUE))
+
+tmp %>% group_by(lighting_bin) %>% 
+  summarize(N=n(), Mean=mean(lighting_mu, na.rm=TRUE), SD=sd(lighting_mu, na.rm=TRUE), Min=min(lighting_mu), Max=max(lighting_mu))
+
+d.raw.noise.sum3 <- d.raw.noise.sum3 %>% left_join(tmp, by=c("filename", "trial", "onset"))
+
+d.raw.noise.sum3$lighting_mu %>% mean(na.rm=TRUE) %>% round()
+d.raw.noise.sum3$lighting_mu %>% sd(na.rm=TRUE) %>% round()
+
+library(GGally)
+# d.raw.noise.sum %>% select(distance_z:occlusion_z) %>% ggpairs()
+d.raw.noise.sum2 %>% select(distance_z:occlusion_z) %>% ggpairs()
+d.raw.noise.sum3 %>% select(offset2_z:angle2_z) %>% ggpairs()
+
+d.raw.noise.sum2 %>% 
+  ggplot(aes(x=distance, y=area_faceprop))+
+  geom_point(size=3, alpha=0.2, se=TRUE)+
+  geom_smooth(method="gam")+
+  theme_classic()+
+  scale_x_continuous(limits=c(270, 1500), breaks=seq(300,1500, 300))+
+  scale_y_continuous(limits=c(0, 0.15), breaks=seq(0, 0.15, 0.03))+
+  labs(y="Proportion of the facial image area", x="Mean distance to the camera per trial [mm]")+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_S2.png"), dpi=350, width=7, height=7)
+
+cor.test(d.raw.noise.sum2$distance_z, d.raw.noise.sum2$area_faceprop_z)
+# cor.test(d.raw.noise.sum2$lighting_mu_z, d.raw.noise.sum2$lighting_sd_z)
+```
+
+
+
+# Fps variability between and within pariticpants (not used in this study)
+
+Calculate/Analyze fps variability within/between participants/trials
+
+```{r}
+# Non-anonym data only
+d.tmp <- d.raw %>% group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(N.frame = n(),
+            Min.time = min(pts_time),
+            Max.time = max(pts_time),
+            Duration = Max.time - Min.time,
+            Fps = N.frame / Duration) %>% ungroup()
+
+d.tmp.ind <- d.tmp %>% group_by(filename) %>% 
+  summarize(N.trial = n(), M.fps = mean(Fps), SD.fps = sd(Fps)) %>% ungroup()
+            
+d.tmp.ind %>% summary()
+
+d.tmp.ind.long <- d.tmp.ind %>% pivot_longer(M.fps:SD.fps, names_to="Variable", values_to="Value")
+
+d.tmp.sum <- d.tmp.ind.long %>% group_by(Variable) %>% 
+  summarize(N=n(), M=mean(Value, na.rm=TRUE), SD=sd(Value, na.rm=TRUE), SE=SD/sqrt(N))
+d.tmp.sum
+
+d.tmp.ind.long %>% ggplot(aes(x=Variable, y=Value))+
+  geom_bar(data=d.tmp.sum, aes(y=M), stat="identity", alpha=0.5)+
+  geom_errorbar(data=d.tmp.sum, aes(y=M, ymax=M+SE, ymin=M-SE), width=0.3)+
+  geom_jitter(alpha=0.4, width=0.05, height=0.002)+
+  theme_classic()+
+  labs(y="Frame rate (fps)")+
+  facet_wrap(~Variable, scales="free")
+
+# tests
+# Between participants
+t.test(d.tmp.ind$M.fps, mu=30)
+cohen.d(d.tmp.ind$M.fps, mu=30, f=NA) #effect size 
+
+ref.fps <- 15:30
+df.tmp <- data.frame()
+for (i in seq_along(ref.fps)){
+  comp <- t.test(d.tmp.ind$M.fps, mu=ref.fps[i])
+  es <- cohen.d(d.tmp.ind$M.fps, mu=ref.fps[i], f=NA) #effect size 
+  df.tmp <- df.tmp %>% rbind(data.frame(ref.fps=ref.fps[i], t.value=comp$statistic, t.df=comp$parameter, p.value=comp$p.value,
+                                        ci.lower=comp$conf.int[1], ci.upper=comp$conf.int[2], cohen.D=es$estimate))
+}
+
+df.tmp <- df.tmp %>% mutate(p.value.adj=p.adjust(p.value, method="holm", n=length(p.value)),
+                            sig=p.adjust(p.value, method="holm", n=length(p.value)) < .05)
+df.tmp
+
+# Within participants
+t.test(d.tmp.ind$SD.fps, mu=0)
+cohen.d(d.tmp.ind$SD.fps, f=NA, mu=0) #effect size 
+
+# Regression (Stimuli-led difference)
+fit <- lmer(Fps ~ objectMovement + complexity + shape + sound + trial + (1|filename), data=d.tmp) # objectNumber 
+summary(fit)
+
+# Regression (Noise-led difference)
+d.tmp <- d.tmp %>% left_join(d.raw.noise.sum, by=intersect(colnames(d.tmp), colnames(d.raw.noise.sum)))
+fit <- lmer(Fps ~ distance_z + offset_left_z + offset_right_z + angle_left_z + angle_right_z + lighting_mu_z + lighting_sd_z + area_faceprop_z + movement_z + (1|filename), data=d.tmp)
+summary(fit)
+vif(fit) # all < 5
+
+d.tmp <- d.tmp %>% left_join(d.raw.noise.sum2, by=intersect(colnames(d.tmp), colnames(d.raw.noise.sum2)))
+fit <- lmer(Fps ~ distance_z + offset_abs_z + angle_abs_z + lighting_mu_z + lighting_sd_z + area_faceprop_z + movement_z + (1|filename), data=d.tmp)
+summary(fit)
+vif(fit) # all < 5
+```
+
+
+
+# Exclusion of "Unsure"
+
+```{r}
+# Exclude from analysis if human annotation is "NA"
+d.raw <- d.raw %>% subset(human_annotation!="") 
+
+d.raw %>% group_by(human_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+d.raw %>% group_by(human2_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+
+d.raw %>% select(filename, onset) %>% unique() %>% count(filename) %>% rename(N.trial=n) %>% 
+  count(N.trial) %>% rename(N.child=n) # All 47 children have 12 trials each (= 564 trials).
+
+
+# Exclude from analysis if "unsure"
+d.raw <- d.raw %>% subset(human_annotation!="unsure") 
+
+d.raw %>% group_by(human_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+d.raw %>% group_by(human2_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+
+d.raw %>% select(filename, onset) %>% unique() %>% count(filename) %>% rename(N.trial=n) %>% 
+  count(N.trial) %>% rename(N.child=n) # 5 trials were removed from 2 children (= 559 trials)
+
+
+# Exclude from analysis if "center" from three-category classification
+d.raw <- d.raw %>% subset(human_annotation!="center") 
+
+d.raw %>% group_by(human_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+d.raw %>% group_by(human2_annotation) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.raw))
+
+d.raw %>% select(filename, onset) %>% unique() %>% count(filename) %>% rename(N.trial=n) %>% 
+  count(N.trial) %>% rename(N.child=n) # Further 2 trials were removed from 2 children (= 557 trials)
+
+tmp <- d.raw %>% select(filename, trial, onset) %>% unique()
+nrow(tmp)
+tmp %>% select(filename) %>% unique() %>% nrow()
+```
+
+
+# Human vs human gaze-coding comparisons (human-human LOOSE reliability)
+
+Human-Human reliability: left/right/away -> agree (1) / disagree (0)
+%agreement, kappa coefficient
+
+```{r}
+d.hh <- read.csv(here("Data", "all_concat_HumanHuman.csv"), header=TRUE) %>% 
+  filter(!filename %in% c("35.mp4", "37.mp4", "38.mp4"))
+
+d.hh$folder %>% unique()
+d.hh %>% select(filename, folder) %>% unique()
+d.hh$filename %>% unique() %>% length()
+d.hh$onset %>% unique()
+d.hh$trial %>% unique()
+
+d.hh <- d.hh %>% filter(str_detect(onset, "^trial"))
+d.hh$folder %>% unique()
+d.hh$onset %>% unique()
+d.hh$HK %>% unique()
+d.hh$MT %>% unique()
+
+d.hh %>% count(HK)
+d.hh %>% count(MT)
+
+
+# Exclude from analysis if human annotation is "NA"
+N.frameNA <- d.hh %>% subset(is.na(HK) | is.na(MT)) %>% nrow()
+N.frameNA
+N.frameNA / nrow(d.hh)
+
+d.hh <- d.hh %>% subset(HK!="" & MT!="") 
+
+d.hh %>% group_by(HK) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+d.hh %>% group_by(MT) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+d.hh %>% mutate(unsure = case_when(HK=="unsure" | MT=="unsure" ~ "unsure", TRUE ~ "No unsure")) %>% 
+  group_by(unsure) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+
+# Exclude from analysis if "unsure"
+d.hh <- d.hh %>% subset(HK!="unsure" & MT!="unsure") 
+
+d.hh %>% group_by(HK) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+d.hh %>% group_by(MT) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+
+# Exclude from analysis if "center"
+d.hh <- d.hh %>% subset(HK!="center" & MT!="center") 
+
+d.hh %>% group_by(HK) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+d.hh %>% group_by(MT) %>% summarize(N.frame=n(), Prop.frame=n()/nrow(d.hh))
+```
+
+
+## Agreement
+
+```{r}
+# Generous agreement
+d.hh.sum <- d.hh %>% group_by(filename, onset) %>% 
+  summarize(N.frame = n(),
+            Prop.MT_as_ref = sum(MT_as_ref==1, na.rm=TRUE) / N.frame,
+            Prop.HK_as_ref = sum(HK_as_ref==1, na.rm=TRUE) / N.frame) %>% ungroup() %>% 
+  mutate(M.prop = (Prop.MT_as_ref + Prop.HK_as_ref)/2,
+         N.crr = round(N.frame * M.prop, 0))
+  # mutate(M.prop = Prop.HK_as_ref)
+
+mean(d.hh.sum$M.prop)
+sd(d.hh.sum$M.prop)
+
+d.hh.sum %>% ggplot(aes(x=M.prop))+
+  geom_histogram(color="white")+
+  theme_classic()
+
+d.hh.sum %>% subset(M.prop < 0.5)
+```
+
+
+```{r}
+# Strict agreement (3 category)
+tmp <- d.hh %>% subset(HK!="unsure" & !is.na(HK))
+tmp %>% count(HK)
+tmp %>% count(MT)
+tmp %>% count(HK, MT)
+
+d.hh.sum <- tmp %>% mutate(Agr3 = case_when(HK == MT ~ 1, TRUE ~ 0)) %>% 
+  group_by(filename, onset) %>% 
+  summarize(N.frame = n(),
+            N.crr3 = sum(Agr3 == "1", na.rm=TRUE),
+            M.prop = N.crr3 / N.frame) %>% ungroup() %>% 
+  mutate(N.crr = round(N.frame * M.prop, 0))
+
+d.hh.sum %>% arrange(M.prop) %>% head()
+# tmp_54 <- tmp %>% subset(filename=="54.mp4" & onset=="trial_7")
+# tmp_11 <- tmp %>% subset(filename=="11.mp4" & onset=="trial_2")
+# rm(tmp_11, tmp_54)
+
+mean(d.hh.sum$M.prop)
+sd(d.hh.sum$M.prop)
+
+d.hh.sum %>% group_by(filename) %>% summarize(N.trial=n())
+
+d.hh.sum %>% ggplot(aes(x=M.prop))+
+  geom_histogram(color="white")+
+  theme_classic()
+
+d.hh.sum %>% subset(M.prop < 0.5)
+
+
+# Strict agreement (2 category, if you want)
+tmp <- tmp %>% mutate(HK2 = case_when(HK=="left" | HK=="right" ~ "looking", TRUE ~ HK),
+                      MT2 = case_when(MT=="left" | MT=="right" ~ "looking", TRUE ~ MT))
+tmp %>% count(HK, HK2)
+tmp %>% count(MT, MT2)
+tmp %>% count(HK2, MT2)
+
+d.hh.sum2 <- tmp %>% mutate(Agr2 = case_when(HK2 == MT2 ~ 1, TRUE ~ 0)) %>% 
+  group_by(filename, onset) %>% 
+  summarize(N.frame = n(),
+            N.crr2 = sum(Agr2 == "1", na.rm=TRUE),
+            M.prop = N.crr2 / N.frame) %>% ungroup() %>% 
+  mutate(N.crr = round(N.frame * M.prop, 0))
+
+d.hh.sum2 %>% arrange(M.prop) %>% head()
+mean(d.hh.sum2$M.prop)
+sd(d.hh.sum2$M.prop)
+
+d.hh.sum2 %>% group_by(filename) %>% summarize(N.trial=n())
+
+d.hh.sum2 %>% ggplot(aes(x=M.prop))+
+  geom_histogram(color="white")+
+  theme_classic()
+
+d.hh.sum2 %>% subset(M.prop < 0.5)
+```
+
+
+
+## Effects of noise factors
+
+```{r}
+# left vs right vs away (absolute value)
+d.hh.sum <- d.hh.sum %>% 
+  left_join(d.raw.noise.sum2, by=intersect(colnames(d.hh.sum), colnames(d.raw.noise.sum2)))
+d.hh.sum %>% subset(is.na(distance))
+d.hh.sum <- d.hh.sum %>% subset(!is.na(distance))
+
+
+# If you want to check raw videos:
+tmp <- d.hh %>% group_by(folder, filename, onset) %>% summarize(start=min(pts_time)) %>% ungroup() %>% 
+  left_join(d.hh.sum)
+
+tmp %>% group_by(filename) %>%
+  summarise(
+    lighting_mu_z_min = min(lighting_mu_z, na.rm = TRUE),
+    onset_min = onset[which.min(lighting_mu_z)],
+    start_min = start[which.min(lighting_mu_z)],
+    lighting_mu_z_max = max(lighting_mu_z, na.rm = TRUE),
+    onset_max = onset[which.max(lighting_mu_z)],
+    start_max = start[which.max(lighting_mu_z)],
+    .groups = "drop")
+
+tmp %>% group_by(filename) %>%
+  summarise(
+    lighting_sd_z_min = min(lighting_sd_z, na.rm = TRUE),
+    onset_min = onset[which.min(lighting_sd_z)],
+    start_min = start[which.min(lighting_sd_z)],
+    lighting_sd_z_max = max(lighting_sd_z, na.rm = TRUE),
+    onset_max = onset[which.max(lighting_sd_z)],
+    start_max = start[which.max(lighting_sd_z)],
+    .groups = "drop")
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ 
+               distance_z + offset_abs_z + angle_abs_z + lighting_mu_z + lighting_sd_z + movement_z + 
+               (1|onset) + (1|filename), 
+             data=d.hh.sum, family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ distance_z, type="response", at=list(distance_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ offset_abs_z, type="response", at=list(offset_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ angle_abs_z, type="response", at=list(angle_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_mu_z, type="response", at=list(lighting_mu_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_sd_z, type="response", at=list(lighting_sd_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ movement_z, type="response", at=list(movement_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+
+pred.cat3 <- ggpredict(fit, terms=c("distance_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="distance_z") %>% 
+  rbind(ggpredict(fit, terms=c("offset_abs_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="offset_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("angle_abs_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="angle_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_mu_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="lighting_mu_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_sd_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="lighting_sd_z")) %>% 
+  rbind(ggpredict(fit, terms=c("movement_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="movement_z")) %>% 
+  mutate(Term=factor(Term, levels=c("distance_z", "offset_abs_z", "angle_abs_z", "movement_z", "lighting_mu_z", "lighting_sd_z")))
+
+facet_labels <- c("distance_z"="Distance to \nthe camera",
+                  "offset_abs_z"="Left-right \noffset",
+                  "angle_abs_z"="Face \nrotation",
+                  "movement_z"="Face \nmovement",
+                  "lighting_mu_z"="Face \nbrightness",
+                  "lighting_sd_z"="Face \nbrightness \nvariability")
+
+pred.cat3 %>% 
+  ggplot(aes(x=z_value, y=predicted))+
+  geom_point(size=3)+
+  geom_line(aes(group=group), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels))+
+  labs(y="Proportion of human–human agreement", x="Z-value")+
+  scale_x_continuous(limits=c(-1.3, 1.3), breaks=c(-1,1))+
+  scale_y_continuous(limits=c(0.13, 1.00), breaks=seq(0.1, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_S3b.png"), dpi=350, width=7.5, height=6.5)
+```
+
+
+```{r}
+# looking vs away (absolute value)
+d.hh.sum <- d.hh.sum2 %>% 
+  left_join(d.raw.noise.sum2, by=intersect(colnames(d.hh.sum2), colnames(d.raw.noise.sum2)))
+d.hh.sum %>% subset(is.na(distance))
+d.hh.sum <- d.hh.sum %>% subset(!is.na(distance))
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ 
+               distance_z + offset_abs_z + angle_abs_z + lighting_mu_z + lighting_sd_z + movement_z + 
+               (1|onset) + (1|filename), 
+             data=d.hh.sum, family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ distance_z, type="response", at=list(distance_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ offset_abs_z, type="response", at=list(offset_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ angle_abs_z, type="response", at=list(angle_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_mu_z, type="response", at=list(lighting_mu_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_sd_z, type="response", at=list(lighting_sd_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ movement_z, type="response", at=list(movement_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+
+pred.cat2 <- ggpredict(fit, terms=c("distance_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="distance_z") %>% 
+  rbind(ggpredict(fit, terms=c("offset_abs_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="offset_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("angle_abs_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="angle_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_mu_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="lighting_mu_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_sd_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="lighting_sd_z")) %>% 
+  rbind(ggpredict(fit, terms=c("movement_z[-1,1]"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x) %>% 
+  mutate(Term="movement_z")) %>% 
+  mutate(Term=factor(Term, levels=c("distance_z", "offset_abs_z", "angle_abs_z", "movement_z", "lighting_mu_z", "lighting_sd_z")))
+
+facet_labels <- c("distance_z"="Distance to \nthe camera",
+                  "offset_abs_z"="Left-right \noffset",
+                  "angle_abs_z"="Face \nrotation",
+                  "movement_z"="Face \nmovement",
+                  "lighting_mu_z"="Face \nbrightness",
+                  "lighting_sd_z"="Face \nbrightness \nvariability")
+
+pred.cat2 %>% 
+  ggplot(aes(x=z_value, y=predicted))+
+  geom_point(size=3)+
+  geom_line(aes(group=group), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels))+
+  labs(y="Proportion of human–human agreement", x="Z-value")+
+  scale_x_continuous(limits=c(-1.3, 1.3), breaks=c(-1,1))+
+  scale_y_continuous(limits=c(0.13, 1.00), breaks=seq(0.1, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_S3a.png"), dpi=350, width=7.5, height=6.5)
+```
+
+
+
+# Automated vs hand-coded gaze-coding comparisons
+
+iCatcher+ / OWLET / Revised AR-based model
+
+3-category (left / right / away) -> chance = 33%
+2-category (look / away) -> chance = 50%
+
+## Generous agreemet
+
+```{r}
+d.raw$human_annotation %>% unique()
+d.raw$human2_annotation %>% unique()
+
+d.tmp <- d.raw %>% group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(N.frame3 = sum(human_annotation!="unsure"),
+            N.frame2 = sum(human2_annotation!="unsure"),
+            icatcher.crr3 = sum(icatcher_pred_as_ref=="1", na.rm=TRUE),
+            icatcher.crr2 = sum(icatcher2_pred_as_ref=="1", na.rm=TRUE),
+            owlet.crr3 = sum(owlet_pred_as_ref=="1", na.rm=TRUE),
+            owlet.crr2 = sum(owlet2_pred_as_ref, na.rm=TRUE),
+            ar.crr3 = sum(ar_pred_as_ref=="1", na.rm=TRUE),
+            ar.crr2 = sum(ar2_pred_as_ref=="1", na.rm=TRUE)) %>% ungroup() %>% 
+  mutate(icatcher.prop3 = icatcher.crr3/N.frame3,
+         icatcher.prop2 = icatcher.crr2/N.frame2,
+         owlet.prop3 = owlet.crr3/N.frame3,
+         owlet.prop2 = owlet.crr2/N.frame2,
+         ar.prop3 = ar.crr3/N.frame3,
+         ar.prop2 = ar.crr2/N.frame2)
+
+d.tmp %>% mutate(N.frame.diff = N.frame3 - N.frame2) %>% select(N.frame.diff) %>% summary() # N.frame3 = N.frame2
+d.tmp <- d.tmp %>% select(-N.frame2) %>% rename(N.frame=N.frame3)
+
+
+# left vs right vs away
+d.tmp %>% group_by(filename) %>% 
+  summarize(N.trial = n(), 
+            M.icatcher = mean(icatcher.prop3, na.rm=TRUE), 
+            M.owlet = mean(owlet.prop3, na.rm=TRUE), 
+            M.ar= mean(ar.prop3, na.rm=TRUE), 
+            SD.icatcher = sd(icatcher.prop3, na.rm=TRUE),
+            SD.owlet = sd(owlet.prop3, na.rm=TRUE),
+            SD.ar = sd(ar.prop3, na.rm=TRUE)) %>% ungroup() %>% summary()
+
+# look vs away
+d.tmp %>% group_by(filename) %>% 
+  summarize(N.trial = n(), 
+            M.icatcher = mean(icatcher.prop2, na.rm=TRUE), 
+            M.owlet = mean(owlet.prop2, na.rm=TRUE), 
+            M.ar= mean(ar.prop2, na.rm=TRUE), 
+            SD.icatcher = sd(icatcher.prop2, na.rm=TRUE),
+            SD.owlet = sd(owlet.prop2, na.rm=TRUE),
+            SD.ar = sd(ar.prop2, na.rm=TRUE)) %>% ungroup() %>% summary()
+
+d.tmp.long <- d.tmp %>% pivot_longer(icatcher.crr3:ar.prop2, names_to=c("model", "variable"), values_to="value", names_sep="\\.") %>% 
+  mutate(model=factor(model, levels=c("icatcher", "owlet", "ar")))
+
+d.tmp.ind <- d.tmp.long %>% filter(str_detect(variable, "prop")) %>% 
+  group_by(filename, model, variable) %>% 
+  summarize(N.trial = n(), 
+            M = mean(value, na.rm=TRUE), 
+            SD = sd(value, na.rm=TRUE)) %>% ungroup()
+
+d.tmp.sum <- d.tmp.ind %>% group_by(model, variable) %>% 
+  summarize(N=n(), MM=mean(M, na.rm=TRUE), SD=sd(M, na.rm=TRUE), SE=SD/sqrt(N))
+d.tmp.sum
+
+facet_labels <- c("prop2"="2 categories\n(Looking or Away)", "prop3"="3 categories\n(Left, Right, or Away)")
+model_labels <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")
+
+d.tmp.ind %>%
+  ggplot(aes(x=model, y=M, color=model, fill=model))+
+  geom_bar(data=d.tmp.sum, aes(y=MM), stat="identity", alpha=0.5)+
+  geom_errorbar(data=d.tmp.sum, aes(y=MM, ymax=MM+SE, ymin=MM-SE), width=0.3)+
+  geom_jitter(alpha=0.3, width=0.05, height=0.002)+
+  # y=0.5 for Category:2
+  geom_hline(data=data.frame(variable="prop2"), aes(yintercept=0.5), linetype="dashed")+
+  # y=0.33 for Category:3
+  geom_hline(data=data.frame(variable="prop3"), aes(yintercept=0.33), linetype="dashed")+
+  theme_classic()+
+  facet_wrap(~variable, labeller=labeller(variable=facet_labels))+
+  scale_x_discrete(labels=model_labels)+ 
+  labs(y="Proportion of correct prediction (relaxed agreement)", x="Model")+
+  guides(color="none", fill="none")+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=14),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=12, color="black"))
+ggsave(file=here("Figures", "Figure_S1_relaxed.png"), dpi=350, width=7.7, height=6.5)
+```
+
+
+```{r}
+# Comparison among algorithms 
+d.tmp.ind <- d.tmp.long %>% filter(str_detect(variable, "crr")) %>% 
+  rename(N.crr=value)
+
+d.tmp.ind.sum <- d.tmp.ind %>% group_by(filename, onset, model, variable) %>% 
+  summarize(N.trial = n(), 
+            N.frame = sum(N.frame, na.rm=TRUE),
+            N.crr = sum(N.crr, na.rm=TRUE)) %>% ungroup()
+
+# left vs right vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model + (1|onset) + (1|filename), 
+             data=d.tmp.ind.sum %>% subset(variable=="crr3"),
+             family=binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, "model", type="response") %>% pairs(adjust="bonferroni")
+pred <- ggpredict(fit, terms=c("model"), type="fixed", bias_correction = TRUE) %>% as.data.frame()
+pred
+
+# look vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model + (1|onset) + (1|filename), 
+             data=d.tmp.ind.sum %>% subset(variable=="crr2"),
+             family=binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, "model", type="response") %>% pairs(adjust="bonferroni")
+pred <- ggpredict(fit, terms=c("model"), type="fixed", bias_correction = TRUE) %>% as.data.frame()
+pred
+```
+
+
+
+## Strict agreement
+
+```{r}
+d.raw$human_annotation %>% unique()
+d.raw$human2_annotation %>% unique()
+
+d.tmp <- d.raw %>% 
+  mutate(icatcher_agr3 = case_when(human_annotation==icatcher_annotation~1, TRUE~0),
+         icatcher_agr2 = case_when(human2_annotation==icatcher2_annotation~1, TRUE~0),
+         owlet_agr3    = case_when(human_annotation==owlet_annotation~1, TRUE~0),
+         owlet_agr2    = case_when(human2_annotation==owlet2_annotation~1, TRUE~0),
+         ar_agr3       = case_when(human_annotation==ar_annotation~1, TRUE~0),
+         ar_agr2 = case_when(human2_annotation==ar2_annotation~1, TRUE~0)) %>% 
+  group_by(filename, trial, onset, objectMovement, objectNumber, complexity, shape, leftSide, rightSide, sound) %>% 
+  summarize(N.frame3 = sum(human_annotation!="unsure"),
+            N.frame2 = sum(human2_annotation!="unsure"),
+            icatcher.crr3 = sum(icatcher_agr3=="1", na.rm=TRUE),
+            icatcher.crr2 = sum(icatcher_agr2=="1", na.rm=TRUE),
+            owlet.crr3 = sum(owlet_agr3=="1", na.rm=TRUE),
+            owlet.crr2 = sum(owlet_agr2, na.rm=TRUE),
+            ar.crr3 = sum(ar_agr3=="1", na.rm=TRUE),
+            ar.crr2 = sum(ar_agr2=="1", na.rm=TRUE)) %>% ungroup() %>% 
+  mutate(icatcher.prop3 = icatcher.crr3/N.frame3,
+         icatcher.prop2 = icatcher.crr2/N.frame2,
+         owlet.prop3 = owlet.crr3/N.frame3,
+         owlet.prop2 = owlet.crr2/N.frame2,
+         ar.prop3 = ar.crr3/N.frame3,
+         ar.prop2 = ar.crr2/N.frame2)
+
+d.tmp %>% mutate(N.frame.diff = N.frame3 - N.frame2) %>% select(N.frame.diff) %>% summary() # N.frame3 = N.frame2
+d.tmp <- d.tmp %>% select(-N.frame2) %>% rename(N.frame=N.frame3)
+d.tmp %>% select(filename, onset) %>% unique() %>% nrow()
+
+# left vs right vs away
+d.tmp %>% group_by(filename) %>% 
+  summarize(N.trial = n(), 
+            M.icatcher = mean(icatcher.prop3, na.rm=TRUE), 
+            M.owlet = mean(owlet.prop3, na.rm=TRUE), 
+            M.ar= mean(ar.prop3, na.rm=TRUE), 
+            SD.icatcher = sd(icatcher.prop3, na.rm=TRUE),
+            SD.owlet = sd(owlet.prop3, na.rm=TRUE),
+            SD.ar = sd(ar.prop3, na.rm=TRUE)) %>% ungroup() %>% summary()
+
+# look vs away
+d.tmp %>% group_by(filename) %>% 
+  summarize(N.trial = n(), 
+            M.icatcher = mean(icatcher.prop2, na.rm=TRUE), 
+            M.owlet = mean(owlet.prop2, na.rm=TRUE), 
+            M.ar= mean(ar.prop2, na.rm=TRUE), 
+            SD.icatcher = sd(icatcher.prop2, na.rm=TRUE),
+            SD.owlet = sd(owlet.prop2, na.rm=TRUE),
+            SD.ar = sd(ar.prop2, na.rm=TRUE)) %>% ungroup() %>% summary()
+
+d.tmp.long <- d.tmp %>% pivot_longer(icatcher.crr3:ar.prop2, names_to=c("model", "variable"), values_to="value", names_sep="\\.") %>% 
+  mutate(model=factor(model, levels=c("icatcher", "owlet", "ar")))
+
+d.tmp.ind <- d.tmp.long %>% filter(str_detect(variable, "prop")) %>% 
+  group_by(filename, model, variable) %>% 
+  summarize(N.trial = n(), 
+            M = mean(value, na.rm=TRUE), 
+            SD = sd(value, na.rm=TRUE)) %>% ungroup()
+
+d.tmp.sum <- d.tmp.ind %>% group_by(model, variable) %>% 
+  summarize(N=n(), MM=mean(M, na.rm=TRUE), SD=sd(M, na.rm=TRUE), SE=SD/sqrt(N))
+d.tmp.sum
+
+facet_labels <- c("prop2"="2 categories\n(Looking or Away)", "prop3"="3 categories\n(Left, Right, or Away)")
+model_labels <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")
+
+d.tmp.ind %>%
+  ggplot(aes(x=model, y=M, color=model, fill=model))+
+  geom_bar(data=d.tmp.sum, aes(y=MM), stat="identity", alpha=0.5)+
+  geom_errorbar(data=d.tmp.sum, aes(y=MM, ymax=MM+SE, ymin=MM-SE), width=0.3)+
+  geom_jitter(alpha=0.3, width=0.05, height=0.002)+
+  # y=0.5 for Category:2
+  geom_hline(data=data.frame(variable="prop2"), aes(yintercept=0.5), linetype="dashed")+
+  # y=0.33 for Category:3
+  geom_hline(data=data.frame(variable="prop3"), aes(yintercept=0.33), linetype="dashed")+
+  theme_classic()+
+  facet_wrap(~variable, labeller=labeller(variable=facet_labels))+
+  scale_x_discrete(labels=model_labels)+ 
+  labs(y="Proportion of correct prediction", x="Model")+
+  guides(color="none", fill="none")+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=14),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=12, color="black"))
+ggsave(file=here("Figures", "Figure_2_strict.png"), dpi=350, width=7.7, height=6.5)
+```
+
+
+```{r}
+# Comparison among algorithms 
+d.tmp.ind <- d.tmp.long %>% filter(str_detect(variable, "crr")) %>% 
+  rename(N.crr=value)
+
+d.tmp.ind.sum <- d.tmp.ind %>% group_by(filename, onset, model, variable) %>% 
+  summarize(N.trial = n(), 
+            N.frame = sum(N.frame, na.rm=TRUE),
+            N.crr = sum(N.crr, na.rm=TRUE)) %>% ungroup()
+
+# left vs right vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model + (1|onset) + (1|filename), 
+             data=d.tmp.ind.sum %>% subset(variable=="crr3"),
+             family=binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, "model", type="response") %>% pairs(adjust="bonferroni")
+pred <- ggpredict(fit, terms=c("model"), type="fixed", bias_correction = TRUE) %>% as.data.frame()
+pred
+
+# look vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model + (1|onset) + (1|filename), 
+             data=d.tmp.ind.sum %>% subset(variable=="crr2"),
+             family=binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, "model", type="response") %>% pairs(adjust="bonferroni")
+pred <- ggpredict(fit, terms=c("model"), type="fixed", bias_correction = TRUE) %>% as.data.frame()
+pred
+```
+
+
+
+# Effects of noise factors on gaze classification prediction
+
+## Absolute values
+
+```{r}
+# left vs right vs away (absolute value)
+d.tmp.ind <- d.tmp.ind %>% left_join(d.raw.noise.sum2, by=intersect(colnames(d.tmp.ind), colnames(d.raw.noise.sum2)))
+
+d.tmp.ind %>% subset(is.na(distance) | is.na(lighting_mu))
+d.tmp.ind <- d.tmp.ind %>% subset(!is.na(distance) & !is.na(lighting_mu))
+d.tmp.ind %>% select(filename, onset) %>% unique() %>% nrow() # 556 trials in total
+d.tmp.ind %>% select(filename, onset) %>% unique() %>% count(filename) %>% rename(N.trial=n) %>% 
+  count(N.trial) %>% rename(N.child=n) # N=47, 12 trials for 42 children, 11 trials for 4 children, 8 trials for 1 child.
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * 
+               (distance_z + offset_abs_z + angle_abs_z + lighting_mu_z + lighting_sd_z + movement_z) + 
+               (1|onset) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr3"), family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ distance_z | model, type="response", at=list(distance_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ offset_abs_z | model, type="response", at=list(offset_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ angle_abs_z | model, type="response", at=list(angle_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_mu_z | model, type="response", at=list(lighting_mu_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_sd_z | model, type="response", at=list(lighting_sd_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ movement_z | model, type="response", at=list(movement_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+# ggpredict(fit, terms=c("distance_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("offset_abs_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("angle_abs_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("lighting_mu_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("lighting_sd_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("movement_z[-1,0,1]", "model"), type="fixed")
+
+pred.cat3 <- ggpredict(fit, terms=c("distance_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="distance_z") %>% 
+  rbind(ggpredict(fit, terms=c("offset_abs_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="offset_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("angle_abs_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="angle_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_mu_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="lighting_mu_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_sd_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="lighting_sd_z")) %>% 
+  rbind(ggpredict(fit, terms=c("movement_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="movement_z")) %>% 
+  mutate(Term=factor(Term, levels=c("distance_z", "offset_abs_z", "angle_abs_z", "movement_z", "lighting_mu_z", "lighting_sd_z")))
+
+pred.cat3$model <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")[pred.cat3$model]
+pred.cat3 <- pred.cat3 %>% mutate(model=factor(model, levels=c("iCatcher+", "OWLET", "AR-based")))
+
+facet_labels <- c("distance_z"="Distance to \nthe camera",
+                  "offset_abs_z"="Left-right \noffset",
+                  "angle_abs_z"="Face \nrotation",
+                  "movement_z"="Face \nmovement",
+                  "lighting_mu_z"="Face \nbrightness",
+                  "lighting_sd_z"="Face \nbrightness \nvariability")
+
+pred.cat3 %>% 
+  ggplot(aes(x=z_value, y=predicted, color=model, fill=model, shape=model))+
+  geom_point(size=3)+
+  geom_line(aes(group=model), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels))+
+  labs(y="Proportion of correct prediction", x="Z-value", color="Model", shape="Model", fill="Model")+
+  scale_x_continuous(limits=c(-1.3, 1.3), breaks=c(-1,1))+
+  scale_y_continuous(limits=c(0.35, 0.92), breaks=seq(0.35, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_3b.png"), dpi=350, width=7.5, height=6.5)
+```
+
+
+```{r}
+# looking vs away (absolute value)
+d.tmp.ind <- d.tmp.ind %>% left_join(d.raw.noise.sum2, by=intersect(colnames(d.tmp.ind), colnames(d.raw.noise.sum2)))
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * 
+               (distance_z + offset_abs_z + angle_abs_z + lighting_mu_z + lighting_sd_z + movement_z) + 
+               (1|onset) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr2"), family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ distance_z | model, type="response", at=list(distance_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ offset_abs_z | model, type="response", at=list(offset_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ angle_abs_z | model, type="response", at=list(angle_abs_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_mu_z | model, type="response", at=list(lighting_mu_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ lighting_sd_z | model, type="response", at=list(lighting_sd_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ movement_z | model, type="response", at=list(movement_z = c(-1, 1))) %>% pairs(combine=TRUE, adjust="bonferroni")
+# ggpredict(fit, terms=c("distance_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("offset_abs_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("angle_abs_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("lighting_mu_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("lighting_sd_z[-1,0,1]", "model"), type="fixed")
+# ggpredict(fit, terms=c("movement_z[-1,0,1]", "model"), type="fixed")
+
+pred.cat2 <- ggpredict(fit, terms=c("distance_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="distance_z") %>% 
+  rbind(ggpredict(fit, terms=c("offset_abs_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="offset_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("angle_abs_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="angle_abs_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_mu_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="lighting_mu_z")) %>% 
+  rbind(ggpredict(fit, terms=c("lighting_sd_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="lighting_sd_z")) %>% 
+  rbind(ggpredict(fit, terms=c("movement_z[-1,1]", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% rename(z_value=x, model=group) %>% 
+  mutate(Term="movement_z")) %>% 
+  mutate(Term=factor(Term, levels=c("distance_z", "offset_abs_z", "angle_abs_z", "movement_z", "lighting_mu_z", "lighting_sd_z")))
+
+pred.cat2$model <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")[pred.cat2$model]
+pred.cat2 <- pred.cat2 %>% mutate(model=factor(model, levels=c("iCatcher+", "OWLET", "AR-based")))
+
+facet_labels <- c("distance_z"="Distance to \nthe camera",
+                  "offset_abs_z"="Left-right \noffset",
+                  "angle_abs_z"="Face \nrotation",
+                  "movement_z"="Face \nmovement",
+                  "lighting_mu_z"="Face \nbrightness",
+                  "lighting_sd_z"="Face \nbrightness \nvariability")
+
+pred.cat2 %>% 
+  ggplot(aes(x=z_value, y=predicted, color=model, fill=model, shape=model))+
+  geom_point(size=3)+
+  geom_line(aes(group=model), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels))+
+  labs(y="Proportion of correct prediction", x="Z-value", color="Model", shape="Model", fill="Model")+
+  scale_x_continuous(limits=c(-1.3, 1.3), breaks=c(-1,1))+
+  scale_y_continuous(limits=c(0.35, 0.92), breaks=seq(0.35, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black"),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_3a.png"), dpi=350, width=7.5, height=6.5)
+```
+
+
+## Discretized values
+```{r}
+# left vs right vs away (e.g., leftward vs rightward)
+d.tmp.ind <- d.tmp.ind %>% left_join(d.raw.noise.sum3, by=intersect(colnames(d.tmp.ind), colnames(d.raw.noise.sum3)))
+
+d.tmp.ind %>% subset(variable=="crr3" & model=="icatcher") %>% group_by(offset_bin) %>% 
+  summarize(N=n(), Mean=mean(offset2, na.rm=TRUE), SD=sd(offset2, na.rm=TRUE), Min=min(offset2), Max=max(offset2))
+
+d.tmp.ind %>% subset(variable=="crr3" & model=="icatcher") %>% 
+  mutate(angle2 = angle2 * 180 / pi) %>% 
+  group_by(angle_bin) %>% 
+  summarize(N=n(), Mean=mean(angle2, na.rm=TRUE), SD=sd(angle2, na.rm=TRUE), Min=min(angle2), Max=max(angle2))
+
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * (offset_bin + angle_bin) + (1|onset) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr3"), family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))) # lighting_bin can be also added.
+summary(fit)
+Anova(fit)
+
+emmeans(fit, ~ offset_bin | model, type="response") %>% pairs(combine=TRUE, adjust="bonferroni")
+emmeans(fit, ~ angle_bin | model, type="response") %>% pairs(combine=TRUE, adjust="bonferroni")
+# ggpredict(fit, terms=c("offset_bin", "model"), type="fixed")
+# ggpredict(fit, terms=c("angle_bin", "model"), type="fixed")
+
+pred.cat3 <- ggpredict(fit, terms=c("offset_bin", "model"), type="fixed", bias_correction=TRUE) %>% 
+  as.data.frame() %>% rename(binNum=x, model=group) %>% mutate(Term="offset") %>% 
+  rbind(ggpredict(fit, terms=c("angle_bin", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% 
+  rename(binNum=x, model=group) %>% mutate(Term="angle")) %>% 
+  mutate(Term=factor(Term, levels=c("offset", "angle")))
+
+pred.cat3$model <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")[pred.cat3$model]
+pred.cat3 <- pred.cat3 %>% mutate(model=factor(model, levels=c("iCatcher+", "OWLET", "AR-based")))
+
+facet_labels <- c("offset"="Left-right \noffset",
+                  "angle"="Face \nrotation")
+
+pred.cat3 <- pred.cat3 %>% 
+  mutate(binLabel = case_when(Term=="offset" & binNum==1 ~ "~-30",
+                              Term=="offset" & binNum==2 ~ "-30~0",
+                              Term=="offset" & binNum==3 ~ "0~+30",
+                              Term=="offset" & binNum==4 ~ "+30~",
+                              Term=="angle" & binNum==1 ~ "~-5",
+                              Term=="angle" & binNum==2 ~ "-5~0",
+                              Term=="angle" & binNum==3 ~ "0~+5",
+                              Term=="angle" & binNum==4 ~ "+5~")) %>% 
+  mutate(binLabel=factor(binLabel,
+                         levels=c("~-30", "-30~0", "0~+30", "+30~",
+                                  "~-5", "-5~0", "0~+5", "+5~"))) 
+
+vline_df <- pred.cat3 %>% filter(binNum %in% c(2, 3)) %>%
+  group_by(Term) %>%
+  summarize(x1=binLabel[binNum==2][1], x2=binLabel[binNum==3][1], .groups="drop") %>%
+  mutate(xintercept=2.5) %>%
+  filter(Term!="lighting")
+
+pred.cat3 %>% ggplot(aes(x=binLabel, y=predicted, color=model, fill=model, shape=model))+
+  geom_point(size=3)+
+  geom_line(aes(group=model), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  geom_vline(data=vline_df, aes(xintercept=xintercept), linetype="dashed") +
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels), scales="free_x")+
+  labs(y="Proportion of correct prediction", 
+       x="Left–right offset[mm], Face rotation[degree]", 
+       color="Model", shape="Model", fill="Model")+
+  scale_y_continuous(limits=c(0.35, 0.923), breaks=seq(0.3, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black", angle=45, h=1),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_4b.png"), dpi=350, width=7, height=6.5)
+```
+
+
+
+```{r}
+# # looking vs away (leftward vs rightward)
+d.tmp.ind <- d.tmp.ind %>% left_join(d.raw.noise.sum3, by=intersect(colnames(d.tmp.ind), colnames(d.raw.noise.sum3)))
+
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * (offset_bin + angle_bin) + (1|onset) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr2"), family=binomial,
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(fit)
+Anova(fit)
+
+emmeans(fit, ~ offset_bin | model, type="response") %>% pairs(combine=TRUE, adjust="bonferroni")
+  emmeans(fit, ~ angle_bin | model, type="response") %>% pairs(combine=TRUE, adjust="bonferroni")
+# ggpredict(fit, terms=c("offset_bin", "model"), type="fixed")
+# ggpredict(fit, terms=c("angle_bin", "model"), type="fixed")
+
+pred.cat2 <- ggpredict(fit, terms=c("offset_bin", "model"), type="fixed", bias_correction=TRUE) %>% 
+  as.data.frame() %>% 
+  rename(binNum=x, model=group) %>% mutate(Term="offset") %>% 
+  rbind(ggpredict(fit, terms=c("angle_bin", "model"), type="fixed", bias_correction=TRUE) %>% as.data.frame() %>% 
+  rename(binNum=x, model=group) %>% mutate(Term="angle")) %>% 
+  mutate(Term=factor(Term, levels=c("offset", "angle")))
+
+pred.cat2$model <- c("icatcher"="iCatcher+", "owlet"="OWLET", "ar"="AR-based")[pred.cat2$model]
+pred.cat2 <- pred.cat2 %>% mutate(model=factor(model, levels=c("iCatcher+", "OWLET", "AR-based")))
+
+facet_labels <- c("offset"="Left-right \noffset",
+                  "angle"="Face \nrotation",
+                  "lighting"="Face \nbrightness")
+
+pred.cat2 <- pred.cat2 %>% 
+  mutate(binLabel = case_when(Term=="offset" & binNum==1 ~ "~-30",
+                              Term=="offset" & binNum==2 ~ "-30~0",
+                              Term=="offset" & binNum==3 ~ "0~+30",
+                              Term=="offset" & binNum==4 ~ "+30~",
+                              Term=="angle" & binNum==1 ~ "~-5",
+                              Term=="angle" & binNum==2 ~ "-5~0",
+                              Term=="angle" & binNum==3 ~ "0~+5",
+                              Term=="angle" & binNum==4 ~ "+5~")) %>% 
+  mutate(binLabel=factor(binLabel,
+                         levels=c("~-30", "-30~0", "0~+30", "+30~",
+                                  "~-5", "-5~0", "0~+5", "+5~"))) 
+
+vline_df <- pred.cat2 %>% filter(binNum %in% c(2, 3)) %>%
+  group_by(Term) %>%
+  summarize(x1=binLabel[binNum==2][1], x2=binLabel[binNum==3][1], .groups="drop") %>%
+  mutate(xintercept=2.5) %>%
+  filter(Term!="lighting")
+
+pred.cat2 %>% ggplot(aes(x=binLabel, y=predicted, color=model, fill=model, shape=model))+
+  geom_point(size=3)+
+  geom_line(aes(group=model), linewidth=1)+
+  geom_errorbar(aes(ymax=conf.high, ymin=conf.low), width=0.1)+
+  geom_vline(data=vline_df, aes(xintercept=xintercept), linetype="dashed") +
+  theme_classic()+
+  facet_grid(~Term, labeller=labeller(Term=facet_labels), scales="free_x")+
+  labs(y="Proportion of correct prediction", 
+       x="Left–right offset[mm], Face rotation[degree]", 
+       color="Model", shape="Model", fill="Model")+
+  scale_y_continuous(limits=c(0.35, 0.923), breaks=seq(0.3, 1.0, 0.05))+
+  theme(plot.title=element_text(size=16,face="bold", color="black"),
+        axis.ticks=element_line(color = "black"),
+        axis.text.x=element_text(size=14, color = "black", angle=45, h=1),
+        axis.text=element_text(size=14, color = "black"),
+        axis.title=element_text(size=14, color="black"),
+        strip.text=element_text(size=13),
+        legend.title=element_text(size=14, color="black", hjust=0.2),
+        legend.text=element_text(size=13, color="black"),
+        legend.position="bottom",
+        legend.box="horizontal")
+ggsave(file=here("Figures", "Figure_4a.png"), dpi=350, width=7, height=6.5)
+```
+
+
+
+```{r}
+# Effects of experimental stimuli on gaze classification prediction (if interested)
+
+# left vs right vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * (objectMovement + complexity + shape + sound + trial) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr3"), family=binomial,
+             # control=glmerControl(optimizer="nlminbwrap", calc.derivs = FALSE, optCtrl = list(maxfun = 10000, maxiter=100000)))
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit <- glm(cbind(N.crr, N.frame-N.crr) ~ model * (objectMovement + complexity + shape + sound + trial), 
+             data=d.tmp.ind %>% subset(variable=="crr3"), family=binomial)
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ objectMovement | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ complexity | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ shape | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ sound | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ trial | model, at=list(trial = c(1, 6, 12))) %>% pairs(combine=TRUE, adjust="bonferroni") 
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="icatcher"), type="fixed")
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="owlet"), type="fixed")
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="ar"), type="fixed")
+
+# look vs away
+fit <- glmer(cbind(N.crr, N.frame-N.crr) ~ model * (objectMovement + complexity + shape + sound + trial) + (1|filename), 
+             data=d.tmp.ind %>% subset(variable=="crr2"), family=binomial,
+             # control=glmerControl(optimizer="nlminbwrap", calc.derivs = FALSE, optCtrl = list(maxfun = 10000, maxiter=100000)))
+             control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit <- glm(cbind(N.crr, N.frame-N.crr) ~ model * (objectMovement + complexity + shape + sound + trial), 
+             data=d.tmp.ind %>% subset(variable=="crr2"), family=binomial)
+
+summary(fit)
+Anova(fit)
+emmeans(fit, ~ objectMovement | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ complexity | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ shape | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ sound | model) %>% pairs(combine=TRUE, adjust="bonferroni") 
+emmeans(fit, ~ trial | model, at=list(trial = c(1, 6, 12))) %>% pairs(combine=TRUE, adjust="bonferroni") 
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="icatcher"), type="fixed")
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="owlet"), type="fixed")
+ggpredict(fit, terms=c("objectMovement", "complexity", "shape", "sound", "trial[All]"), condition=c(model="ar"), type="fixed")
+```
+
+
+
+# For Data Sharing
+
+```{r}
+library(data.table)
+library(here)
+library(tidyverse)
+
+# All data
+d <- fread(here("Data", "all_concat_2026Jan15.csv")) %>% filter(!filename %in% c("35.mp4", "37.mp4", "38.mp4"))
+
+# Private 23 + Scientific 20 + Public 4 = 47
+d %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+d2 <- d %>% filter(!folder %in% c("Private", "PrivatebrighterAI"))
+
+d2 %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+fwrite(d2, here("Data", "ForSharing", "all_concat_2026Jan15_forSharing.csv"))
+
+
+# Participant info
+d <- fread(here("Data", "participant_info.csv")) %>% filter(!filename %in% c("35.mp4", "37.mp4", "38.mp4"))
+
+d %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+d2 <- d %>% filter(!folder %in% c("Private", "PrivatebrighterAI"))
+
+d2 %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+fwrite(d2, here("Data", "ForSharing", "participant_info_forSharing.csv"))
+
+
+# Human-Human annotation
+d <- fread(here("Data", "all_concat_HumanHuman.csv")) %>% filter(!filename %in% c("35.mp4", "37.mp4", "38.mp4"))
+
+d %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+d2 <- d %>% filter(!folder %in% c("Private", "PrivatebrighterAI"))
+
+d2 %>% select(folder, filename) %>% unique() %>% group_by(folder) %>% 
+  summarize(N=n())
+
+fwrite(d2, here("Data", "ForSharing", "all_concat_HumanHuman.csv"))
+
+```
+
+
