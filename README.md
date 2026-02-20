@@ -32,3 +32,7 @@ Scripts for merging the results of ffprobe with other results.
 ### human-human_reliabitilty
 
 Scripts for calculating reliability between two human annotations using a time window.
+
+### noise
+
+Scripts for calculating noise factors.
